@@ -3,13 +3,10 @@ import numpy as np
 import os
 from joblib import dump, load
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, recall_score, roc_auc_score, balanced_accuracy_score, roc_curve, matthews_corrcoef, precision_score, precision_recall_curve, auc, average_precision_score
-from sklearn.model_selection import cross_val_predict, StratifiedKFold, KFold, LeaveOneOut
-import xgboost as xgb
-from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, recall_score, roc_auc_score,roc_curve, matthews_corrcoef, precision_score, precision_recall_curve, auc, average_precision_score
+from sklearn.model_selection import cross_val_predict, StratifiedKFold
 import matplotlib.pyplot as plt
 import shap
-from sklearn.model_selection import GridSearchCV
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 import joblib
@@ -28,8 +25,7 @@ def remove_highly_correlated_features(df, threshold=0.7):
     corr_matrix = df.corr().abs()
     # Create a mask for the upper triangle
     upper = corr_matrix.where(
-        pd.DataFrame(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool), 
-                     index=corr_matrix.index, columns=corr_matrix.columns)
+        pd.DataFrame(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool), index=corr_matrix.index, columns=corr_matrix.columns)
     )
     # Identify columns to drop based on threshold
     to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
@@ -83,6 +79,111 @@ def y_prediction_cv(model, x_train, y_train, col_name):
     return y_pred, metrics
 
 
+def plot_auc_auprc_cv(model, x_train, y_train, col_name):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    tprs = []
+    aucs = []
+    mean_fpr = np.linspace(0, 1, 100)
+    precisions = []
+    auprcs = []
+    mean_recall = np.linspace(0, 1, 100)
+
+    # ROC Curve
+    plt.figure(figsize=(5, 3))
+    for i, (train_idx, val_idx) in enumerate(skf.split(x_train, y_train)):
+        x_tr, x_val = x_train.iloc[train_idx], x_train.iloc[val_idx]
+        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+        model.fit(x_tr, y_tr)
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(x_val)[:, 1]
+        else:
+            y_score = model.decision_function(x_val)
+        # ROC
+        fpr, tpr, _ = roc_curve(y_val, y_score)
+        roc_auc = auc(fpr, tpr)
+        aucs.append(roc_auc)
+        plt.plot(fpr, tpr, lw=1, alpha=0.7, label=f"Fold {i+1} (AUC = {roc_auc:.2f})")
+        # Interpolate tpr
+        tprs.append(np.interp(mean_fpr, fpr, tpr))
+        tprs[-1][0] = 0.0
+    # Plot mean ROC
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_auc = auc(mean_fpr, mean_tpr)
+    std_auc = np.std(aucs)
+    plt.plot(mean_fpr, mean_tpr, color='b', label=f"Mean AUROC = {mean_auc:.2f} ± {std_auc:.2f}", lw=2)
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray', lw=1)
+    plt.xlabel("1-Specificity", fontsize=12, fontstyle='italic', weight="bold")
+    plt.ylabel("Sensitivity", fontsize=12, fontstyle='italic', weight="bold")
+    plt.title(f"AUROC - {col_name}", fontsize=12, fontstyle='italic', weight="bold")
+    plt.legend(bbox_to_anchor=(1,1), loc="upper left", fontsize='small')
+    plt.tight_layout()
+    plt.savefig(os.path.join("graph_metrics",f"{col_name}_roc_auc_cv.png"), dpi=500)
+    plt.close()
+
+    # Precision-Recall Curve
+    plt.figure(figsize=(5, 3))
+    for i, (train_idx, val_idx) in enumerate(skf.split(x_train, y_train)):
+        x_tr, x_val = x_train.iloc[train_idx], x_train.iloc[val_idx]
+        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+        model.fit(x_tr, y_tr)
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(x_val)[:, 1]
+        else:
+            y_score = model.decision_function(x_val)
+        precision, recall, _ = precision_recall_curve(y_val, y_score)
+        auprc = average_precision_score(y_val, y_score)
+        auprcs.append(auprc)
+        plt.plot(recall, precision, lw=1, alpha=0.7, label=f"Fold {i+1} (AUPRC = {auprc:.2f})")
+        # Interpolate precision
+        precisions.append(np.interp(mean_recall, recall[::-1], precision[::-1]))
+    # Plot mean PRC
+    mean_precision = np.mean(precisions, axis=0)
+    mean_auprc = np.mean(auprcs)
+    std_auprc = np.std(auprcs)
+    plt.plot(mean_recall, mean_precision, color='b', label=f"Mean AUPRC = {mean_auprc:.2f} ± {std_auprc:.2f}", lw=2)
+    plt.xlabel("Recall (Sensitivity)", fontsize=12, fontstyle='italic', weight="bold")
+    plt.ylabel("Precision", fontsize=12, fontstyle='italic', weight="bold")
+    plt.title(f"AUPRC - {col_name}", fontsize=12, fontstyle='italic', weight="bold")
+    plt.legend(bbox_to_anchor=(1,1), loc="upper left", fontsize='small')
+    plt.tight_layout()
+    plt.savefig(os.path.join("graph_metrics",f"{col_name}_prc_auprc_cv.png"), dpi=500)
+    plt.close()
+
+# Plot AUROC and AUPRC for Test Set
+def plot_auc_auprc_test(model, x_test, y_test, col_name):
+    plt.figure(figsize=(4, 3))
+    # Predict probabilities
+    if hasattr(model, "predict_proba"):
+        y_score = model.predict_proba(x_test)[:, 1]
+    else:
+        y_score = model.decision_function(x_test)
+    # ROC Curve
+    fpr, tpr, _ = roc_curve(y_test, y_score)
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, color='b', lw=2, label=f"AUROC = {roc_auc:.2f}")
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray', lw=1)
+    plt.xlabel("1-Specificity", fontsize=12, fontstyle='italic', weight="bold")
+    plt.ylabel("Sensitivity", fontsize=12, fontstyle='italic', weight="bold")
+    plt.title(f"AUROC - {col_name} (Test Set)", fontsize=12, fontstyle='italic', weight="bold")
+    plt.legend(bbox_to_anchor=(1,1), loc="upper left", fontsize='small')
+    plt.tight_layout()
+    plt.savefig(os.path.join("graph_metrics",f"{col_name}_roc_auc_test.png"), dpi=500)
+    plt.close()
+
+    # Precision-Recall Curve
+    plt.figure(figsize=(5, 3))
+    precision, recall, _ = precision_recall_curve(y_test, y_score)
+    auprc = average_precision_score(y_test, y_score)
+    plt.plot(recall, precision, color='b', lw=2, label=f"AUPRC = {auprc:.2f}")
+    plt.xlabel("Recall (Sensitivity)", fontsize=12, fontstyle='italic', weight="bold")
+    plt.ylabel("Precision", fontsize=12, fontstyle='italic', weight="bold")
+    plt.title(f"AUPRC - {col_name} (Test Set)", fontsize=12, fontstyle='italic', weight="bold")
+    plt.legend(bbox_to_anchor=(1,1), loc="upper left", fontsize='small')
+    plt.tight_layout()
+    plt.savefig(os.path.join("graph_metrics",f"{col_name}_prc_auprc_test.png"), dpi=500)
+    plt.close()
+    
+
 def plot_confusion_matrix_with_acc(y_true, y_pred, class_names, title="Confusion Matrix", filename="confusion_matrix.png"):
     """
     Plots a confusion matrix with per-class accuracy (%) in each box.
@@ -119,6 +220,7 @@ def plot_confusion_matrix_with_acc(y_true, y_pred, class_names, title="Confusion
     plt.savefig(os.path.join("graph_metrics", filename), dpi=500, bbox_inches='tight')
     plt.close()
 
+    
 
 def plot_confusion_matrix_cv(y_true, y_pred, class_names, title="Confusion Matrix (CV)", filename="confusion_matrix_cv.png"):
     """
@@ -155,6 +257,99 @@ def plot_confusion_matrix_cv(y_true, y_pred, class_names, title="Confusion Matri
     plt.savefig(os.path.join("graph_metrics", filename), dpi=500, bbox_inches='tight')
     plt.close()
 
+
+def nearest_neighbor_AD(x_train, x_test, name, k, z=3):
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=k, algorithm='brute', metric='euclidean').fit(x_train)
+    dump(nn, os.path.join("graph_ad", "ad_"+ str(k) +"_"+ str(z) +".joblib"))
+    distance, index = nn.kneighbors(x_train)
+    # Calculate mean and sd of distance in train set
+    di = np.mean(distance, axis=1)
+    # Find mean and sd of di
+    dk = np.mean(di)
+    sk = np.std(di)
+    print('dk = ', dk)
+    print('sk = ', sk)
+    # Calculate di of test
+    distance, index = nn.kneighbors(x_test)
+    di = np.mean(distance, axis=1)
+    AD_status = ['within_AD' if di[i] < dk + (z * sk) else 'outside_AD' for i in range(len(di))]
+
+    # Create DataFrame with index from x_test and the respective status
+    df = pd.DataFrame(AD_status, index=x_test.index, columns=['AD_status'])
+    return df, dk, sk
+
+def run_ad(stacked_model, stack_train, stack_test, y_test, name, z = 0.5):
+    k_values = [5,6,7, 8, 9, 10]
+    ACC_values = []
+    MCC_values = []
+    AUROC_values = []
+    AUPRC_values = []
+    removed_compounds_values = []
+    dk_values = []
+    sk_values = []
+    
+    for i in k_values:
+        print('k = ', i, 'z=', str(z))
+        t, dk, sk = nearest_neighbor_AD(stack_train, stack_test, name, i, z=z)
+        print(t['AD_status'].value_counts())
+        x_ad_test = stack_test[t['AD_status'] == 'within_AD']
+        y_ad_test = y_test.loc[x_ad_test.index]
+        y_pred_test = stacked_model.predict(x_ad_test)
+        print(len(x_ad_test),len(y_ad_test), len(y_pred_test) )
+        acc = round(accuracy_score(y_ad_test, y_pred_test), 3)
+        auroc = round(roc_auc_score(y_ad_test, y_pred_test), 3)
+        mcc = round(matthews_corrcoef(y_ad_test, y_pred_test), 3)
+        auprc = round(average_precision_score(y_ad_test, y_pred_test), 3)
+        print('MCC: ', mcc,'AUROC: ', auroc,'AUPRC:', auprc)
+        ACC_values.append(acc)
+        MCC_values.append(mcc)
+        AUROC_values.append(auroc)
+        AUPRC_values.append(auprc)
+        removed_compounds_values.append((t['AD_status'] == 'outside_AD').sum())
+        dk_values.append(dk)
+        sk_values.append(sk)
+    k_values   = np.array(k_values)
+    ACC_values = np.array(ACC_values)
+    MCC_values = np.array(MCC_values)
+    AUROC_values = np.array(AUROC_values)
+    AUPRC_values = np.array(AUPRC_values)
+    dk_values  = np.array(dk_values)
+    sk_values  = np.array(sk_values)
+    removed_compounds_values = np.array(removed_compounds_values)
+    # Save table
+    ad_metrics = pd.DataFrame({
+        "k": k_values[:len(MCC_values)],  # Adjust if some values are skipped
+        "Accuracy": ACC_values,
+        "MCC": MCC_values,
+        "AUROC": AUROC_values,
+        "AUPRC": AUPRC_values,
+        "Removed Compounds": removed_compounds_values,
+        "dk_values": dk_values,
+        "sk_values": sk_values
+    })
+    ad_metrics = round(ad_metrics, 3)
+    ad_metrics.to_csv(os.path.join("graph_ad","AD_metrics_"+name+"_"+ str(z)+ ".csv"))
+    # Plotting
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3))
+    
+    ax1.plot(k_values, ACC_values,  'bo-',  label = "Accuracy")
+    ax1.plot(k_values, MCC_values, 'r^-', label = "MCC")
+    ax1.plot(k_values, AUROC_values, 'md-', label = "AUROC")
+    ax1.plot(k_values, AUPRC_values, 'gs-', label = "AUPRC")
+    # Adding labels and title
+    ax1.set_xlabel('k',      fontsize=12, fontstyle='italic',weight="bold")
+    ax1.set_ylabel('Scores', fontsize=12, fontstyle='italic', weight='bold')
+    ax1.set_xticks(k_values)
+    ax1.legend(loc='upper left', fontsize='small', bbox_to_anchor=(1.05, 1.02))
+    # Second plot: Bar plot for removed_compounds_values
+    ax2.bar(k_values, removed_compounds_values, color='green', edgecolor='black', alpha=0.5, width=0.3)
+    ax2.set_xlabel('k', fontsize=12, fontstyle='italic',weight="bold")
+    ax2.set_ylabel('Removed compounds', fontsize=12, fontstyle='italic', weight='bold')
+    ax2.set_xticks(k_values)
+    plt.tight_layout()
+    plt.savefig(os.path.join("graph_ad","AD_"+name+"_"+ str(z)+ "_Classification_separated.png"), bbox_inches='tight', dpi=500) 
+    plt.close
 
 def y_random(x_train, x_test, y_train, y_test, metric_train, metric_test, name):
     ACC_test = []
@@ -234,7 +429,7 @@ def compute_and_plot_shap(model, x_train, x_test, output_prefix, top_n=20, save_
 
 def main():
     all_results = []
-    for x in ['AP2DC','AD2D','EState','CDKExt','CDK','CDKGraph','KRFPC','KRFP','MACCS','PubChem','SubFPC','SubFP', 'Desc', 'ECFP']:
+    for x in ['AP2DC','AP2D','EState','CDKExt','CDK','CDKGraph','KRFPC','KRFP','MACCS','PubChem','SubFPC','SubFP', 'Desc', 'ECFP']:
         print("#"*100) 
         x_train = pd.read_csv(os.path.join("trpa1", "train", x+".csv"), index_col=0)
         y_train = pd.read_csv(os.path.join("trpa1", "train", "y_train.csv"), index_col=0)
@@ -291,11 +486,20 @@ def main():
         # Predict 5-cv and test
         y_pred_cv, metrics_cv = y_prediction_cv(model, x_train_scaled, y_train, x)
         y_pred_test, metrics_test = y_prediction(model, x_test_scaled, y_test, x)
+        
+        # Save y_pred for further analysis
+        y_pred_cv.to_csv(os.path.join("y_predictions", f"{x}_cv_prediction.csv"))
+        y_pred_test.to_csv(os.path.join("y_predictions", f"{x}_test_prediction.csv"))
 
+        
+        # Plot ROC and PRC
+        plot_auc_auprc_cv(model, x_train_scaled, y_train, x)
+        plot_auc_auprc_test(model, x_test_scaled, y_test, x)
         # Plot confusion matrix
         plot_confusion_matrix_with_acc(y_test, y_pred_test, ["Inactive", "Active"], title="Confusion Matrix - Test Set", filename=f"confusion_matrix_{x}_test.png")
         plot_confusion_matrix_cv(y_train, y_pred_cv, ["Inactive", "Active"], title="Confusion Matrix - CV", filename=f"confusion_matrix_{x}_cv.png")
-
+        # AD analysis
+        run_ad(model, x_train_scaled, x_test_scaled, y_test, x, z=0.5)
         # Y-randomization
         y_random(x_train_scaled, x_test_scaled, y_train, y_test, metrics_cv, metrics_test, x)
         
